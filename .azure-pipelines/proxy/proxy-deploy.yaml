@@ -1,0 +1,226 @@
+# For guidance on setting up the deploy pipeline, see: https://docs.microsoft.com/en-us/azure/devops/pipelines/ecosystems/deploy-linux-vm?view=azure-devops&tabs=java#define-cd-steps-to-deploy-to-the-linux-vm
+
+# YAML Schema reference: https://docs.microsoft.com/en-us/azure/devops/pipelines/yaml-schema/?view=azure-pipelines#:~:text=The%20YAML%20schema%20reference%20for,pipelines%2C%20see%20Customize%20your%20pipeline.
+
+# See for System variables (eg $(System.DefaultWorkingDirectory)): https://docs.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml
+# and https://github.com/MicrosoftDocs/azure-devops-docs/blob/main/docs/pipelines/build/includes/variables-hosted.md
+
+variables:
+    environmentTarget: development
+    resourceTarget: openihp-proxy-dev
+    proxyUrl: openihp-proxy-dev.services.theahie.net
+
+pr: none
+
+trigger:
+  branches:
+    include:
+    - main
+    - feat/nginx-proxy
+  paths:
+    exclude:
+    - proxy/README.md
+    - README.md
+
+stages:
+  - stage: deploy_proxy
+    displayName: 'Deploy proxy'
+    jobs:
+    # jobs.deployment: https://docs.microsoft.com/en-us/azure/devops/pipelines/yaml-schema/jobs-deployment?view=azure-pipelines
+    - deployment: VMDeploy
+      workspace:  
+        clean: all
+      displayName: proxy-server-deploy
+      pool:
+        vmImage: 'Ubuntu-latest'
+      environment:
+        # jobs.deployment.environment: https://docs.microsoft.com/en-us/azure/devops/pipelines/yaml-schema/jobs-deployment-environment
+        resourceType: VirtualMachine
+        name: ${{ variables.environmentTarget }}.${{ variables.resourceTarget }}
+      strategy:
+          runOnce:
+            deploy:
+              steps: 
+              - checkout: self
+                clean: true
+              - task: Bash@3
+                displayName: "Cleanup nginx"
+                inputs:
+                  targetType: 'inline'
+                  script: |
+                    sudo systemctl stop nginx || true
+                    sudo rm -rf /usr/lib/nginx
+                    sudo apt purge nginx -y
+                    sudo deluser nginx && sudo groupdel nginx
+                    sudo apt autoremove -y
+              - task: Bash@3
+                displayName: "Install, update & upgrade"
+                inputs:
+                  targetType: 'inline'
+                  script: | 
+                    ######## '/sbin/nologin' https://unix.stackexchange.com/questions/10852/whats-the-difference-between-sbin-nologin-and-bin-false
+                    ######## 'useradd' https://linux.die.net/man/8/useradd
+                    ######## groupadd https://linux.die.net/man/8/groupadd
+
+                    ######## Running service as non-root user: https://vinayakpandey-7997.medium.com/run-nginx-servers-master-and-worker-process-with-non-root-user-4feee9375ac
+                    sudo groupadd -r nginx && sudo useradd nginx -r -g nginx -d /var/cache/nginx -s /sbin/nologin
+
+                    release=$(lsb_release -cs)
+               
+                    ######## /etc/apt/sources.list.d/nginx.list configured with key to allow 'sudo apt source nginx' download of running package version
+                    sudo curl -sL https://nginx.org/keys/nginx_signing.key | sudo apt-key add
+                    sudo bash -c 'echo -e "deb https://nginx.org/packages/ubuntu/ '$release' nginx\ndeb-src https://nginx.org/packages/ubuntu/ '$release' nginx" > /etc/apt/sources.list.d/nginx.list'
+
+                    # sudo bash -c 'echo -e "deb https://nginx.org/packages/ubuntu/ focal nginx\ndeb-src https://nginx.org/packages/ubuntu/ focal nginx" > /etc/apt/sources.list.d/nginx.list'
+            
+
+                    sudo apt update -y
+                    sudo apt -o Dpkg::Options::="--force-confnew" upgrade -y
+                    sudo apt install -o Dpkg::Options::="--force-confnew" nginx -y
+                    sudo systemctl stop nginx || true
+                    sudo apt install certbot -y
+
+                    ######## Below for installing mod_security module
+                    sudo apt install -o Dpkg::Options::="--force-confnew" make build-essential libpcre3 libpcre3-dev zlib1g-dev libcurl4-openssl-dev uuid-dev -y
+                    sudo apt install -o Dpkg::Options::="--force-confnew" libmodsecurity3 libmodsecurity-dev -y
+
+                    sudo apt update -y
+                    sudo apt -o Dpkg::Options::="--force-confnew" upgrade -y                
+
+              - task: Bash@3
+                displayName: "Compile and install nginx modules"
+                inputs:
+                  targetType: 'inline'
+                  script: | 
+                    sudo groupadd -r acme
+                    
+                    export nginx_version=$(nginx -v 2>&1 | sed 's/nginx version: nginx\///')
+                    export nginx_folder=nginx-"$nginx_version"
+                    export OWASPCoreRulesetVersion=3.3.2
+
+                    sudo mkdir -p /usr/local/src/nginx
+                    cd /usr/local/src/nginx
+                    if [ -d "/usr/local/src/nginx/$nginx_folder" ] 
+                    then
+                        echo "nginx $nginx_version already downloaded" 
+                    else
+                      sudo apt source nginx
+                    fi
+                    
+                    cd ./"$nginx_folder"
+                    
+                    echo "######## Installing and configuring mod_security with OWASP Core ruleset ########"
+
+                    ######## See table 3.2. Folder permissions https://www.feistyduck.com/library/modsecurity-handbook-free/online/ch03-configuration.html
+                    
+                    sudo mkdir -p /opt/modsecurity
+                    sudo mkdir -p /opt/modsecurity/var
+                    sudo mkdir -p /opt/modsecurity/var/tmp
+                    sudo mkdir -p /opt/modsecurity/var/data
+                    sudo chown root:nginx /opt/modsecurity && sudo chmod 750 /opt/modsecurity
+                    sudo chown root:nginx /opt/modsecurity/var && sudo chmod 750 /opt/modsecurity/var
+                    sudo chown nginx:nginx /opt/modsecurity/var/tmp && sudo chmod 750 /opt/modsecurity/var/tmp
+                    sudo chown nginx:root /opt/modsecurity/var/data && sudo chmod 700 /opt/modsecurity/var/data
+                    
+                    ######## How to Install ModSecurity for Nginx on Debian/Ubuntu https://www.tecmint.com/install-modsecurity-nginx-debian-ubuntu/
+                    if [ -d "/usr/local/src/ModSecurity" ] 
+                    then
+                        echo "Directory /usr/local/src/ModSecurity exists. No clone performed for https://github.com/SpiderLabs/ModSecurity.git" 
+                    else
+                      sudo git clone -b v3.0.6 --depth 1 https://github.com/SpiderLabs/ModSecurity.git /usr/local/src/ModSecurity
+                    fi
+                    if [ -d "/usr/local/src/ModSecurity-nginx" ] 
+                    then
+                        echo "Directory /usr/local/src/ModSecurity-nginx exists. No clone performed for https://github.com/SpiderLabs/ModSecurity-nginx.git" 
+                    else
+                      sudo git clone -b v1.0.2 --depth 1 https://github.com/SpiderLabs/ModSecurity-nginx.git /usr/local/src/ModSecurity-nginx
+                    fi
+
+                    sudo ./configure --with-compat --add-dynamic-module=/usr/local/src/ModSecurity-nginx
+                    sudo make modules
+
+                    cd ~
+
+                    sudo -E sh -c '\cp -a /usr/local/src/nginx/"$nginx_folder"/objs/ngx_http_modsecurity_module.so /usr/lib/nginx/modules'
+                    sudo mkdir /etc/nginx/modsec/
+                    sudo sh -c '\cp -a /usr/local/src/ModSecurity/modsecurity.conf-recommended /etc/nginx/modsec/modsecurity.conf'
+
+                    echo "######## Modifying /etc/nginx/modsec/modsecurity.conf ########"
+
+                    sudo sed -i 's/SecRuleEngine DetectionOnly/SecRuleEngine On/' /etc/nginx/modsec/modsecurity.conf
+                    sudo sed -i 's/SecAuditLog \/var\/log\/modsec_audit.log/SecAuditLog \/var\/log\/nginx\/modsec_audit.log/' /etc/nginx/modsec/modsecurity.conf
+                    sudo sed -i 's/SecTmpDir \/tmp\//SecAuditLog \/opt\/modsecurity\/var\/tmp\//' /etc/nginx/modsec/modsecurity.conf
+                    sudo sed -i 's/SecDataDir \/tmp\//SecDataDir \/opt\/modsecurity\/var\/data\//' /etc/nginx/modsec/modsecurity.conf
+
+                    if [ "$(isProduction)" = 'True' ]
+                    then
+                      ######## See configuration guidelines: https://docs.nginx.com/nginx-waf/admin-guide/nginx-plus-modsecurity-waf-installation-logging/
+                      sudo sed -i 's/SecAuditEngine RelevantOnly/SecAuditEngine off/' /etc/nginx/modsec/modsecurity.conf
+                    fi       
+
+                    sudo -E sh -c 'echo "Include /etc/nginx/modsec/modsecurity.conf\nInclude /etc/nginx/modsec/coreruleset-$OWASPCoreRulesetVersion/crs-setup.conf\nInclude /etc/nginx/modsec/coreruleset-$OWASPCoreRulesetVersion/rules/*.conf\n" > /etc/nginx/modsec/main.conf'
+                    
+                    sudo sh -c '\cp -a /usr/local/src/ModSecurity/unicode.mapping /etc/nginx/modsec/'
+                    
+                    if [ -f "v$OWASPCoreRulesetVersion.tar.gz" ]
+                    then 
+                      echo coreruleset-$OWASPCoreRulesetVersion already downloaded
+                    else
+                      sudo wget https://github.com/coreruleset/coreruleset/archive/v"$OWASPCoreRulesetVersion".tar.gz
+                    fi
+
+                    if [ -d "/etc/nginx/modsec/coreruleset-$OWASPCoreRulesetVersion" ]
+                    then
+                      echo coreruleset-$OWASPCoreRulesetVersion already extracted
+                    else
+                      sudo tar xvf v"$OWASPCoreRulesetVersion".tar.gz -C /etc/nginx/modsec/
+                      sudo -E sh -c '\cp /etc/nginx/modsec/coreruleset-"$OWASPCoreRulesetVersion"/crs-setup.conf.example /etc/nginx/modsec/coreruleset-"$OWASPCoreRulesetVersion"/crs-setup.conf'
+                    fi
+                    
+              - task: Bash@3
+                displayName: "Setup nginx"
+                inputs:
+                  targetType: 'inline'
+                  script: |
+                    sudo systemctl stop nginx || true
+                    
+                    ######## See (install nginx and configure it as a reverse proxy server): https://docs.microsoft.com/en-us/troubleshoot/developer/webapps/aspnetcore/practice-troubleshoot-linux/2-2-install-nginx-configure-it-reverse-proxy
+                    
+                    sudo sh -c '\cp -a $(Build.SourcesDirectory)/proxy/environments/shared/nginx/. /etc/nginx'
+                    sudo sh -c '\cp -a $(Build.SourcesDirectory)/proxy/environments/$(environmentTarget)/nginx/. /etc/nginx'
+                    
+                    sudo sh -c '\cp -a $(Build.SourcesDirectory)/proxy/environments/shared/usr/. /usr'
+                    sudo sh -c '\cp -a $(Build.SourcesDirectory)/proxy/environments/$(environmentTarget)/usr/. /usr'
+
+                    sudo systemctl daemon-reload
+                                  
+                    ######## How To Secure Nginx with Let's Encrypt on Ubuntu 20.04 https://www.digitalocean.com/community/tutorials/how-to-secure-nginx-with-let-s-encrypt-on-ubuntu-20-04
+                    ######## Certbot command-line reference: https://eff-certbot.readthedocs.io/en/stable/using.html#certbot-command-line-options
+                    
+                    # Force renewal if certs are test certs -- this should be commented out if/when testing certificates and the --test-cert flag should be used (see cli)
+                    sudo certbot certificates | grep -q "INVALID: TEST_CERT"
+                    if [ $? -eq 0 ]
+                    then
+                      sudo certbot certonly -n --standalone -d "$(proxyUrl)" --agree-tos --force-renewal --email saul.nachman@westerncape.gov.za
+                    else
+                      sudo certbot certonly -n --standalone -d "$(proxyUrl)" --agree-tos --email saul.nachman@westerncape.gov.za
+                    fi
+
+                    conf_file=/etc/letsencrypt/renewal/"$(proxyUrl)".conf
+                    
+                    if [[ -f "$conf_file" ]]; then
+                      # Test to see if the relevant lines have already been inserted before doing so if not
+                      grep -q "pre_hook = service nginx stop" "$conf_file"
+                      if [ $? -ne 0 ]
+                      then
+                        sudo bash -c 'printf %s "$(cat /etc/letsencrypt/renewal/'$(proxyUrl)'.conf)" > "'${conf_file}'"'
+                        sudo bash -c 'echo -e "\npre_hook = service nginx stop\npost_hook = service nginx start" >> "'${conf_file}'"'
+                      fi
+                    else 
+                      echo 'Certificate installation must have failed'
+                      exit 1;
+                    fi
+
+                    sudo chown -R root:acme /etc/letsencrypt/{live,archive}
+                    
+                    sudo systemctl start nginx

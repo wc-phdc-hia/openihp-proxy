@@ -1,0 +1,58 @@
+# For sandboxing nginx service, see:
+# https://www.sherbers.de/running-nginx-without-root/
+# https://github.com/stephan13360/systemd-services
+# https://github.com/stephan13360/systemd-services/blob/master/nginx/nginx.service
+
+[Unit]
+Description=A high performance web server and a reverse proxy server
+Documentation=man:nginx(8)
+After=network-online.target remote-fs.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/sbin/nginx -c /etc/nginx/nginx.conf
+ExecReload=/usr/sbin/nginx -s reload
+
+User=nginx
+Group=nginx
+Restart=on-failure
+RestartSec=10s
+SupplementaryGroups=acme
+RuntimeDirectory=nginx
+LogsDirectory=nginx
+CacheDirectory=nginx
+ConfigurationDirectory=nginx
+
+# filesystem access
+TemporaryFileSystem=/:ro
+BindReadOnlyPaths=/lib/ /lib64/ /usr/lib/ /usr/lib64/ /etc/ld.so.cache /etc/ld.so.conf /etc/ld.so.conf.d/ /etc/bindresvport.blacklist /usr/share/zoneinfo/ /usr/share/locale/ /etc/localtime /usr/share/common-licenses/ /etc/ssl/certs/ /etc/nginx/ssl/ /etc/resolv.conf
+BindReadOnlyPaths=/dev/log /run/systemd/journal/socket /run/systemd/journal/stdout /run/systemd/notify
+BindReadOnlyPaths=/usr/sbin/nginx 
+BindReadOnlyPaths=/run/ /etc/letsencrypt/live/ /etc/letsencrypt/archive/ /opt/modsecurity/
+
+PrivateTmp=true
+PrivateDevices=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+
+# network
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# misc
+SystemCallArchitectures=native
+NoNewPrivileges=true
+RestrictRealtime=true
+MemoryDenyWriteExecute=true
+ProtectKernelLogs=true
+LockPersonality=true
+ProtectHostname=true
+RemoveIPC=true
+RestrictSUIDSGID=true
+ProtectClock=true
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
