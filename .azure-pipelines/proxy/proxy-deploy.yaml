@@ -226,3 +226,4 @@ stages:
                     sudo chmod -R -g+xr /etc/letsencrypt/{live,archive}
                     
                     sudo systemctl start nginx
+
