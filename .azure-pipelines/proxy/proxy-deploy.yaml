@@ -222,5 +222,7 @@ stages:
                     fi
 
                     sudo chown -R root:acme /etc/letsencrypt/{live,archive}
+                    # Assign group permissions
+                    sudo chmod -R -g+xr /etc/letsencrypt/{live,archive}
                     
                     sudo systemctl start nginx
